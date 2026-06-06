@@ -9,46 +9,150 @@ using namespace std;
 using namespace nvcuda;
 
 __global__ void kernel(int dim_m, int dim_n, int dim_k,
-		       float *d_a, float *d_b, float *d_c) {
-  int offset_a_m = 64 * blockIdx.x;
-  int offset_b_n = 64 * blockIdx.y;
-  int i = threadIdx.x;
-  int warp_id = threadIdx.x / 32;
+                       float *d_a, float *d_b, float *d_c)
+{
+    int offset_a_m = 64 * blockIdx.x;
+    int offset_b_n = 64 * blockIdx.y;
+    int warp_id = threadIdx.x / 32;
 
-  __shared__ half block_a[16][64];
-  __shared__ half block_b[16][64];
+    __shared__ half block_a[2][16][64 + 8];
+    __shared__ half block_b[2][64][16 + 8];
 
-  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
-  for (int r = 0; r < 2; r++)
-    for (int c = 0; c < 4; c++)
-      wmma::fill_fragment(acc[r][c], 0.0f);
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
+#pragma unroll
+    for (int r = 0; r < 2; r++)
+#pragma unroll
+        for (int c = 0; c < 4; c++)
+            wmma::fill_fragment(acc[r][c], 0.0f);
 
-  for (int k = 0; k < dim_k; k += 16) {
-    __syncthreads();
-    for (int j = 0; j < 16; ++j) {
-      block_a[j][i] = __float2half(d_a[(k + j) * dim_m + offset_a_m + i]);
-      block_b[j][i] = __float2half(d_b[(offset_b_n + i) * dim_k + k + j]);
+    float4 prefetch_a[4];
+    float4 prefetch_b[4];
+
+#pragma unroll
+    for (int step = 0; step < 4; step++)
+    {
+        int idx = step * 64 + threadIdx.x;
+        int row_a = idx / 16;
+        int col_a = (idx % 16) * 4;
+        prefetch_a[step] = *reinterpret_cast<float4 *>(&d_a[row_a * dim_m + offset_a_m + col_a]);
+    }
+#pragma unroll
+    for (int step = 0; step < 4; step++)
+    {
+        int idx = step * 64 + threadIdx.x;
+        int n_coord = idx / 4;
+        int k_vec = idx % 4;
+        prefetch_b[step] = *reinterpret_cast<float4 *>(&d_b[(offset_b_n + n_coord) * dim_k + k_vec * 4]);
+    }
+
+#pragma unroll
+    for (int step = 0; step < 4; step++)
+    {
+        int idx = step * 64 + threadIdx.x;
+        int row_a = idx / 16;
+        int col_a = (idx % 16) * 4;
+        half2 *sa_ptr = (half2 *)&block_a[0][row_a][col_a];
+        sa_ptr[0] = __floats2half2_rn(prefetch_a[step].x, prefetch_a[step].y);
+        sa_ptr[1] = __floats2half2_rn(prefetch_a[step].z, prefetch_a[step].w);
+    }
+#pragma unroll
+    for (int step = 0; step < 4; step++)
+    {
+        int idx = step * 64 + threadIdx.x;
+        int n_coord = idx / 4;
+        int k_vec = idx % 4;
+        half2 *sb_ptr = (half2 *)&block_b[0][n_coord][k_vec * 4];
+        sb_ptr[0] = __floats2half2_rn(prefetch_b[step].x, prefetch_b[step].y);
+        sb_ptr[1] = __floats2half2_rn(prefetch_b[step].z, prefetch_b[step].w);
     }
     __syncthreads();
-    for (int r = 0; r < 2; r++) {
-      int row_tile = warp_id * 2 + r;
-      wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
-      wmma::load_matrix_sync(a_frag, &block_a[0][row_tile * 16], 64);
-      for (int c = 0; c < 4; c++) {
-        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
-        wmma::load_matrix_sync(b_frag, &block_b[0][c * 16], 64);
-        wmma::mma_sync(acc[r][c], a_frag, b_frag, acc[r][c]);
-      }
+
+    int stage = 0;
+
+    for (int k = 0; k < dim_k; k += 16)
+    {
+        int next_k = k + 16;
+        int next_stage = stage ^ 1;
+
+        if (next_k < dim_k)
+        {
+#pragma unroll
+            for (int step = 0; step < 4; step++)
+            {
+                int idx = step * 64 + threadIdx.x;
+                int row_a = idx / 16;
+                int col_a = (idx % 16) * 4;
+                prefetch_a[step] = *reinterpret_cast<float4 *>(&d_a[(next_k + row_a) * dim_m + offset_a_m + col_a]);
+            }
+#pragma unroll
+            for (int step = 0; step < 4; step++)
+            {
+                int idx = step * 64 + threadIdx.x;
+                int n_coord = idx / 4;
+                int k_vec = idx % 4;
+                prefetch_b[step] = *reinterpret_cast<float4 *>(&d_b[(offset_b_n + n_coord) * dim_k + next_k + k_vec * 4]);
+            }
+        }
+
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag[4];
+#pragma unroll
+        for (int c = 0; c < 4; ++c)
+        {
+            wmma::load_matrix_sync(b_frag[c], &block_b[stage][c * 16][0], 16 + 8);
+        }
+
+#pragma unroll
+        for (int r = 0; r < 2; r++)
+        {
+            int row_tile = warp_id * 2 + r;
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
+            wmma::load_matrix_sync(a_frag, &block_a[stage][0][row_tile * 16], 64 + 8);
+#pragma unroll
+            for (int c = 0; c < 4; c++)
+            {
+                wmma::mma_sync(acc[r][c], a_frag, b_frag[c], acc[r][c]);
+            }
+        }
+
+        if (next_k < dim_k)
+        {
+#pragma unroll
+            for (int step = 0; step < 4; step++)
+            {
+                int idx = step * 64 + threadIdx.x;
+                int row_a = idx / 16;
+                int col_a = (idx % 16) * 4;
+                half2 *sa_ptr = (half2 *)&block_a[next_stage][row_a][col_a];
+                sa_ptr[0] = __floats2half2_rn(prefetch_a[step].x, prefetch_a[step].y);
+                sa_ptr[1] = __floats2half2_rn(prefetch_a[step].z, prefetch_a[step].w);
+            }
+#pragma unroll
+            for (int step = 0; step < 4; step++)
+            {
+                int idx = step * 64 + threadIdx.x;
+                int n_coord = idx / 4;
+                int k_vec = idx % 4;
+                half2 *sb_ptr = (half2 *)&block_b[next_stage][n_coord][k_vec * 4];
+                sb_ptr[0] = __floats2half2_rn(prefetch_b[step].x, prefetch_b[step].y);
+                sb_ptr[1] = __floats2half2_rn(prefetch_b[step].z, prefetch_b[step].w);
+            }
+        }
+        __syncthreads();
+        stage = next_stage;
     }
-  }
-  for (int r = 0; r < 2; r++) {
-    for (int c = 0; c < 4; c++) {
-      int c_m = offset_a_m + (warp_id * 2 + r) * 16;
-      int c_n = offset_b_n + c * 16;
-      if (c_n < dim_n && c_m < dim_m)
-        wmma::store_matrix_sync(&d_c[c_n * dim_m + c_m], acc[r][c], dim_m, wmma::mem_col_major);
+
+#pragma unroll
+    for (int r = 0; r < 2; r++)
+    {
+#pragma unroll
+        for (int c = 0; c < 4; c++)
+        {
+            int c_m = offset_a_m + (warp_id * 2 + r) * 16;
+            int c_n = offset_b_n + c * 16;
+            if (c_n < dim_n && c_m < dim_m)
+                wmma::store_matrix_sync(&d_c[c_n * dim_m + c_m], acc[r][c], dim_m, wmma::mem_col_major);
+        }
     }
-  }
 }
 
 int main(int argc, const char **argv) {
